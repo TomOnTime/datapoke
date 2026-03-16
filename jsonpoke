@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""
+jsonpoke - A command-line tool for reading and manipulating JSON files using dot-path notation.
+Equivalent of yamlpoke but for JSON files.
+"""
+
+import sys
+import re
+import json
+import argparse
+import fnmatch
+from pathlib import Path
+from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Helpers: path parsing  (shared logic with yamlpoke)
+# ---------------------------------------------------------------------------
+
+def parse_path(path_str: str) -> list:
+    """
+    Parse a dotted path like 'foo.bar[2].baz' into a list of str/int segments.
+    Supports:
+      - dot notation:    foo.bar.baz
+      - bracket indices: foo[0].bar  or  foo.[0].bar
+      - quoted keys:     foo."my key".bar  or  foo.'my key'.bar
+    """
+    if not path_str or path_str == ".":
+        return []
+
+    segments = []
+    token_re = re.compile(
+        r'"([^"]*)"'
+        r"|'([^']*)'"
+        r"|\[(\d+)\]"
+        r"|([^.\[\]\"']+)"
+    )
+    for m in token_re.finditer(path_str):
+        dq, sq, idx, plain = m.groups()
+        if dq is not None:
+            segments.append(dq)
+        elif sq is not None:
+            segments.append(sq)
+        elif idx is not None:
+            segments.append(int(idx))
+        elif plain:
+            plain = plain.strip(".")
+            if plain:
+                segments.append(plain)
+    return segments
+
+
+def segments_to_path_str(segments: list) -> str:
+    parts = []
+    for seg in segments:
+        if isinstance(seg, int):
+            if parts:
+                parts[-1] = parts[-1] + f"[{seg}]"
+            else:
+                parts.append(f"[{seg}]")
+        else:
+            if "." in str(seg) or " " in str(seg):
+                parts.append(f'"{seg}"')
+            else:
+                parts.append(str(seg))
+    return ".".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Helpers: traversal & listing
+# ---------------------------------------------------------------------------
+
+def list_paths(node: Any, prefix: list = None) -> list[tuple[list, Any]]:
+    if prefix is None:
+        prefix = []
+    results = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            results.extend(list_paths(v, prefix + [k]))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            results.extend(list_paths(v, prefix + [i]))
+    else:
+        results.append((prefix, node))
+    return results
+
+
+def format_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+# ---------------------------------------------------------------------------
+# Helpers: get / set on nested structures
+# ---------------------------------------------------------------------------
+
+def get_value(node: Any, segments: list) -> Any:
+    for seg in segments:
+        if isinstance(seg, int):
+            node = node[seg]
+        elif isinstance(node, dict):
+            node = node[seg]
+        else:
+            raise KeyError(seg)
+    return node
+
+
+def set_value(node: Any, segments: list, value: Any, no_create: bool = False) -> Any:
+    if not segments:
+        return value
+
+    if node is None:
+        if no_create:
+            raise KeyError("Path does not exist and --no-create is set")
+        node = {}
+
+    head, tail = segments[0], segments[1:]
+
+    if isinstance(head, int):
+        if not isinstance(node, list):
+            raise TypeError(f"Expected list at this level, got {type(node).__name__}")
+        while len(node) <= head:
+            if no_create:
+                raise IndexError(f"Index {head} out of range and --no-create is set")
+            node.append(None)
+        node[head] = set_value(node[head], tail, value, no_create)
+    else:
+        if not isinstance(node, dict):
+            raise TypeError(f"Expected dict at this level, got {type(node).__name__}")
+        if head not in node and no_create:
+            raise KeyError(f"Key '{head}' not found and --no-create is set")
+        node[head] = set_value(node.get(head), tail, value, no_create)
+
+    return node
+
+
+# ---------------------------------------------------------------------------
+# Helpers: wildcard matching traversal
+# ---------------------------------------------------------------------------
+
+def find_wildcard_matches(node: Any, pattern_segs: list, current_path: list = None):
+    if current_path is None:
+        current_path = []
+    if not pattern_segs:
+        yield current_path, node
+        return
+
+    head = pattern_segs[0]
+    rest = pattern_segs[1:]
+
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if fnmatch.fnmatch(str(k), str(head)):
+                yield from find_wildcard_matches(v, rest, current_path + [k])
+    elif isinstance(node, list):
+        if isinstance(head, int):
+            if 0 <= head < len(node):
+                yield from find_wildcard_matches(node[head], rest, current_path + [head])
+        elif str(head) == "*":
+            for i, v in enumerate(node):
+                yield from find_wildcard_matches(v, rest, current_path + [i])
+
+
+# ---------------------------------------------------------------------------
+# Value coercion
+# ---------------------------------------------------------------------------
+
+def coerce_value(raw: str) -> Any:
+    """Parse the string as JSON if possible, else keep as string."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
+
+
+# ---------------------------------------------------------------------------
+# JSON I/O
+# ---------------------------------------------------------------------------
+
+def load_json(path: Path) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_json(path: Path, data: Any, indent: int = 2) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=indent, ensure_ascii=False)
+        f.write("\n")
+
+
+def detect_indent(path: Path) -> int:
+    """Try to detect the indentation used in an existing JSON file."""
+    try:
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            if stripped and line != stripped:
+                indent = len(line) - len(stripped)
+                return indent
+    except Exception:
+        pass
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# Sub-commands
+# ---------------------------------------------------------------------------
+
+def cmd_list(args):
+    path = Path(args.file)
+    if not path.exists():
+        print(f"Error: file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    data = load_json(path)
+    leaves = list_paths(data)
+
+    if not leaves:
+        print("(empty document)")
+        return
+
+    for segments, value in leaves:
+        path_str = segments_to_path_str(segments)
+        print(f"{path_str}: {format_scalar(value)}")
+
+
+def cmd_poke(args):
+    value = coerce_value(args.value)
+    segments = parse_path(args.path)
+
+    if not segments:
+        print("Error: empty path", file=sys.stderr)
+        sys.exit(1)
+
+    for fname in args.files:
+        fpath = Path(fname)
+        if not fpath.exists():
+            print(f"Error: file not found: {fpath}", file=sys.stderr)
+            continue
+
+        indent = detect_indent(fpath)
+        data = load_json(fpath)
+
+        if args.no_create:
+            try:
+                get_value(data, segments)
+            except (KeyError, IndexError, TypeError):
+                print(f"Skipped {fpath}: path '{args.path}' not found (--no-create)", file=sys.stderr)
+                continue
+
+        try:
+            data = set_value(data, segments, value, no_create=False)
+            save_json(fpath, data, indent=indent)
+            print(f"Updated {fpath}: {args.path} = {format_scalar(value)}")
+        except (KeyError, IndexError, TypeError) as e:
+            print(f"Error in {fpath}: {e}", file=sys.stderr)
+
+
+def cmd_update(args):
+    """
+    Wildcard-match a path, then upsert a sub-path value on each match.
+    If subpath is empty or '.', the matched node itself is replaced.
+    """
+    pattern_segs = parse_path(args.path)
+    sub_segs = parse_path(args.subpath) if args.subpath else []
+    value = coerce_value(args.value)
+
+    if not pattern_segs:
+        print("Error: empty path pattern", file=sys.stderr)
+        sys.exit(1)
+
+    for fname in args.files:
+        fpath = Path(fname)
+        if not fpath.exists():
+            print(f"Error: file not found: {fpath}", file=sys.stderr)
+            continue
+
+        indent = detect_indent(fpath)
+        data = load_json(fpath)
+        matches = list(find_wildcard_matches(data, pattern_segs))
+
+        if not matches:
+            print(f"No matches in {fpath} for pattern '{args.path}'")
+            continue
+
+        for match_segs, _match_node in matches:
+            full_segs = match_segs + sub_segs
+            full_path_str = segments_to_path_str(full_segs)
+            try:
+                data = set_value(data, full_segs, value, no_create=False)
+                print(f"Updated {fpath}: {full_path_str} = {format_scalar(value)}")
+            except (KeyError, TypeError) as e:
+                print(f"Error in {fpath} at {full_path_str}: {e}", file=sys.stderr)
+
+        save_json(fpath, data, indent=indent)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing & entry point
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="jsonpoke",
+        description="Read and manipulate JSON files using dot-path notation.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+EXAMPLES
+  # List all paths in a file
+  jsonpoke list config.json
+
+  # Set (or create) a value
+  jsonpoke poke foo.bar.baz 42 config.json
+
+  # Set a value only if the path already exists
+  jsonpoke poke --no-create server.port 8080 *.json
+
+  # Wildcard update: for every match of foo.*.baz, upsert .myitem = 5
+  jsonpoke update "foo.*.baz" myitem 5 config.json
+
+  # Wildcard update with empty subpath: replace the matched node itself
+  jsonpoke update "services.*.enabled" . false config.json
+
+PATH SYNTAX
+  foo.bar.baz          Dot-separated keys
+  items[0].name        List index with bracket notation
+  "key with spaces"    Quoted key containing dots or spaces
+  foo.*.bar            Wildcard (* matches any single key) — update mode only
+""",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_list = sub.add_parser("list", help="List all paths and values in a JSON file")
+    p_list.add_argument("file", help="JSON file to inspect")
+
+    p_poke = sub.add_parser("poke", help="Set a value at a specific path")
+    p_poke.add_argument("path", help="Dotted path (e.g. foo.bar.baz)")
+    p_poke.add_argument("value", help="Value to set (JSON-typed: 42, true, null, or a string)")
+    p_poke.add_argument("files", nargs="+", metavar="FILE", help="JSON file(s) to modify")
+    p_poke.add_argument(
+        "--no-create",
+        action="store_true",
+        help="Skip files/paths where the path doesn't already exist",
+    )
+
+    p_update = sub.add_parser(
+        "update",
+        help="Wildcard-match a path and upsert a sub-path on each match",
+    )
+    p_update.add_argument("path", help="Dotted path pattern with optional wildcards (e.g. foo.*.baz)")
+    p_update.add_argument("subpath", help="Sub-path to upsert under each match, or '.' to replace the matched node itself")
+    p_update.add_argument("value", help="Value to set")
+    p_update.add_argument("files", nargs="+", metavar="FILE", help="JSON file(s) to modify")
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    dispatch = {
+        "list": cmd_list,
+        "poke": cmd_poke,
+        "update": cmd_update,
+    }
+    dispatch[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

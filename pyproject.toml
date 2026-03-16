@@ -1,0 +1,7 @@
+[project]
+name = "datapoke"
+version = "0.1.0"
+description = "Update your JSON or YAML files one poke at a time"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
